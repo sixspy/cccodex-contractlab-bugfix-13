@@ -53,7 +53,8 @@ createApp({
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
-    const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
+    const detail=ref(null);
+    const form=ref({subject:'订单入站', payload_fields:'order_id,amount', contract_version:'', source:'抓取补采'});
     const nav=['契约版本','入站校验','双写缓冲','契约对账'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
@@ -84,12 +85,21 @@ createApp({
     }
     async function validate(){
       actionErr.value='';
-      const r=await fetch('/api/ingress/validate',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});
-      const j=await r.json(); actionErr.value=r.ok?('校验结果：'+j.result+(j.missing?('；缺 '+j.missing.join(',')):'')):(j.detail||'失败');
+      const body={subject:form.value.subject, payload_fields:form.value.payload_fields, source:form.value.source};
+      if((form.value.contract_version||'').trim()) body.contract_version=form.value.contract_version.trim();
+      const r=await fetch('/api/ingress/validate',{method:'POST',headers:auth(),body:JSON.stringify(body)});
+      const j=await r.json();
+      if(!r.ok){
+        actionErr.value=(j.detail||'失败');
+        if(j.kind) actionErr.value='【'+j.kind+'】'+actionErr.value;
+      }else{
+        actionErr.value='校验结果：'+j.result+(j.missing?('；缺 '+j.missing.join(',')):'')+'（契约版本 '+j.version+'）';
+      }
       await refresh();
     }
+    function showDetail(b){ detail.value=b; }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,detail,login,logout,validate,showDetail};
   },
   template:`
   <div v-if="!token" class="login">
@@ -118,28 +128,46 @@ createApp({
       <div class="card">
         <h2>提交入站</h2>
         <label>主题</label><input v-model="form.subject"/>
+        <label>声明契约版本（留空 = 该主题启用正式契约）</label><input v-model="form.contract_version" placeholder="如 v3"/>
+        <label>来源</label><input v-model="form.source"/>
         <label>载荷字段</label><input v-model="form.payload_fields"/>
         <button class="primary" @click="validate">按正式契约校验</button>
         <div class="err">{{actionErr}}</div>
       </div>
       <div class="card">
         <h2>最近批次</h2>
-        <table><thead><tr><th>批次</th><th>结果</th><th>说明</th></tr></thead>
-        <tbody><tr v-for="b in (batches||[]).slice(0,8)" :key="b.id">
+        <table><thead><tr><th>批次</th><th>结果</th><th>契约</th><th>说明</th></tr></thead>
+        <tbody><tr v-for="b in (batches||[]).slice(0,8)" :key="b.id" @click="showDetail(b)" style="cursor:pointer">
           <td>#{{b.id}} {{b.subject}}</td>
           <td><span class="stamp" :class="{bad:b.result!=='通过'}">{{b.result}}</span></td>
+          <td>{{b.contract_version}} / {{b.contract_subject}}<span v-if="!b.subject_consistent" class="stamp bad">主题不一致</span></td>
           <td>{{b.detail}}</td>
         </tr></tbody></table>
+        <div v-if="detail" class="meta" style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px">
+          详情 #{{detail.id}} · 主题 {{detail.subject}} · 契约 {{detail.contract_version}}（{{detail.contract_subject}}）·
+          载荷 {{detail.payload_fields}} · {{detail.created_at}}
+        </div>
       </div>
     </div>
     <div class="card" v-show="tab===2">
       <h2>双写缓冲</h2>
-      <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>原因</th></tr></thead>
-      <tbody><tr v-for="b in buffers" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td></tr></tbody></table>
+      <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>契约</th><th>原因</th></tr></thead>
+      <tbody><tr v-for="b in buffers" :key="b.id">
+        <td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td>
+        <td>{{b.contract_version}} / {{b.contract_subject}}<span v-if="!b.subject_consistent" class="stamp bad">主题不一致</span></td>
+        <td>{{b.reason}}</td>
+      </tr></tbody></table>
     </div>
     <div class="card" v-show="tab===3">
       <h2>契约对账摘要</h2>
       <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <p>主题一致：{{recon.subject_aligned}} · 主题不一致批次 {{recon.subject_mismatch}}</p>
+      <p class="meta">主题串写簿：串写拒绝 {{recon.cross_write_rejections||0}} · 口径偏离 {{recon.ledger_deviations||0}} · 串写争用 {{recon.cross_write_contentions||0}} · 主题争用 {{recon.subject_contentions||0}}</p>
+      <table><thead><tr><th>#</th><th>主题</th><th>声明版本</th><th>命中版本</th><th>类型</th><th>原因</th></tr></thead>
+      <tbody><tr v-for="l in (recon.ledger||[]).slice(0,10)" :key="l.id">
+        <td>{{l.id}}</td><td>{{l.subject}}</td><td>{{l.declared_version||'—'}}</td><td>{{l.matched_version||'—'}}</td>
+        <td><span class="stamp bad">{{l.kind}}</span></td><td>{{l.reason}}</td>
+      </tr></tbody></table>
     </div>
   </div>`
 }).mount('#app');
